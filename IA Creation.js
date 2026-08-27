@@ -639,7 +639,10 @@ define(['N/record', 'N/search', 'N/runtime', 'N/email', 'N/query', 'N/log'],
             // and set it explicitly (UI sourcing does not fire server-side)
             var reasonAccount = getReasonAccount(adjReason);
             if (reasonAccount) {
-                iaRec.setValue({ fieldId: 'account', value: reasonAccount });
+                // Dynamic mode needs a number here, not the string search.lookupFields()
+                // returns - passing a string silently fails to select the option (no
+                // error, field just reads back empty at save time).
+                iaRec.setValue({ fieldId: 'account', value: parseInt(reasonAccount, 10) });
                 log.debug('Account sourced from reason', 'Reason: ' + adjReason + ' Account: ' + reasonAccount);
             } else {
                 log.error('No account on reason', 'Reason record ' + adjReason + ' has no account mapped.');
