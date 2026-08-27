@@ -16,8 +16,14 @@
  * either script can be updated in place (paste new code into the
  * existing Script record) without managing a separate shared file.
  * If the validation logic changes, update BOTH files.
+ *
+ * Recall support: users holding the [Seviroli] - Inventory Adjustment
+ * Role (internal id 1695) skip all of the above. That role exists only
+ * to log Sam's Club recall returns of SAU290B150 at Garden City - see
+ * the RECALL BYPASS block below.
  */
-define(['N/search', 'N/query', 'N/log'], function (search, query, log) {
+define(['N/search', 'N/query', 'N/log', 'N/record', 'N/runtime', 'N/lock'],
+    function (search, query, log, record, runtime, lock) {
 
     // NetSuite account ID, used to build the Bin List link dropped into
     // the error message when a Bin/LP problem is found.
@@ -28,6 +34,16 @@ define(['N/search', 'N/query', 'N/log'], function (search, query, log) {
     // pre-fill parameters are exposed by this deployment.
     var CYCLE_COUNT_SCRIPT_ID = '4889';
     var CYCLE_COUNT_DEPLOY_ID = '1';
+
+    // ------------------------------------------------------------------
+    // Recall bypass - [Seviroli] - Inventory Adjustment Role
+    // ------------------------------------------------------------------
+    var BYPASS_ROLE_ID     = 1695; // [Seviroli] - Inventory Adjustment Role
+    var BYPASS_LOCATION_ID = 11;   // Seviroli Food Garden City
+    var BYPASS_ITEM_ID     = 11953; // SAU290B150
+    var LP_PREFIX          = 'S';
+    var LP_START_NUMBER    = 1000;
+    var LP_COUNTER_LOCK_KEY = 'sams_return_bin_lp_counter';
 
     // customrecord_inventory_adjustment_reques -> custrecord_approval_status
     // values that count as "final" (no longer reserve quantity against
@@ -92,6 +108,53 @@ define(['N/search', 'N/query', 'N/log'], function (search, query, log) {
             'different Bin/LP or Lot, or kick off a cycle count if the on-hand count looks wrong: ' +
             buildCycleCountLink() + '.';
         return msg;
+    }
+
+    // ------------------------------------------------------------------
+    // isBypassRole - true when the record is being saved by someone
+    // holding the recall-only Inventory Adjustment Role.
+    // ------------------------------------------------------------------
+    function isBypassRole() {
+        try {
+            var currentUser = runtime.getCurrentUser();
+            return !!currentUser && Number(currentUser.role) === BYPASS_ROLE_ID;
+        } catch (e) {
+            log.error('isBypassRole failed', e.message);
+            return false;
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // createNextReturnBin - mints the next S#### return LP, creates the
+    // real Bin record for it (flagged "Sam's Return Bin"), and returns
+    // its name. Locked so two lines saved back-to-back can't land on the
+    // same number.
+    // ------------------------------------------------------------------
+    function createNextReturnBin() {
+        var scriptLock = lock.acquireLock({ key: LP_COUNTER_LOCK_KEY, timeout: 15 });
+        try {
+            var sql =
+                "SELECT MAX(TO_NUMBER(SUBSTR(binnumber, 2))) AS maxnum FROM bin " +
+                "WHERE custrecord_sams_return_bin = 'T' AND REGEXP_LIKE(binnumber, '^" + LP_PREFIX + "[0-9]+$')";
+            var results = query.runSuiteQL({ query: sql }).asMappedResults();
+            var maxNum = (results.length > 0 && results[0].maxnum !== null && results[0].maxnum !== undefined)
+                ? parseInt(results[0].maxnum, 10) : (LP_START_NUMBER - 1);
+            var nextNum = Math.max(maxNum + 1, LP_START_NUMBER);
+            var binName = LP_PREFIX + nextNum;
+
+            var binRecord = record.create({ type: 'bin', isDynamic: false });
+            binRecord.setValue({ fieldId: 'binnumber', value: binName });
+            binRecord.setValue({ fieldId: 'location', value: BYPASS_LOCATION_ID });
+            binRecord.setValue({ fieldId: 'custrecord_sams_return_bin', value: true });
+            binRecord.save();
+
+            return binName;
+        } catch (e) {
+            log.error('createNextReturnBin failed', e.message);
+            throw new Error('Could not create the next return LP: ' + e.message);
+        } finally {
+            scriptLock.release();
+        }
     }
 
     // ------------------------------------------------------------------
@@ -274,6 +337,32 @@ define(['N/search', 'N/query', 'N/log'], function (search, query, log) {
                 parentId = existing.custrecord_ia_request[0].value;
             }
             if (qty === '' || qty === null) { qty = existing.custrecord_adjust_qty_by; }
+        }
+
+        // ------------------------------------------------------------
+        // RECALL BYPASS - [Seviroli] - Inventory Adjustment Role
+        // Item/location are forced regardless of what was submitted, a
+        // new S#### return LP is minted the first time the line is
+        // saved if one isn't already assigned, and none of the normal
+        // Bin/Lot/quantity-available checks below apply - this is a
+        // brand-new, empty LP receiving a positive recall return.
+        // ------------------------------------------------------------
+        if (isBypassRole()) {
+            rec.setValue({ fieldId: 'custrecord_item', value: BYPASS_ITEM_ID });
+            rec.setValue({ fieldId: 'custrecord_location', value: BYPASS_LOCATION_ID });
+
+            var bypassQty = parseFloat(qty) || 0;
+            if (bypassQty <= 0) {
+                throw new Error('Enter a quantity greater than zero for this recall return line.');
+            }
+
+            if (!binName) {
+                binName = createNextReturnBin();
+                rec.setValue({ fieldId: 'custrecord_binlp_number', value: binName });
+            }
+
+            rec.setValue({ fieldId: 'custrecord_sev_current_on_hand_available', value: 0 });
+            return;
         }
 
         // Fall back to the parent header location if the line location is blank
