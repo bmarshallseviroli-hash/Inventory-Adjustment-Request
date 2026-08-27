@@ -22,8 +22,8 @@
  * to log Sam's Club recall returns of SAU290B150 at Garden City - see
  * the RECALL BYPASS block below.
  */
-define(['N/search', 'N/query', 'N/log', 'N/record', 'N/runtime', 'N/lock'],
-    function (search, query, log, record, runtime, lock) {
+define(['N/search', 'N/query', 'N/log', 'N/record', 'N/runtime'],
+    function (search, query, log, record, runtime) {
 
     // NetSuite account ID, used to build the Bin List link dropped into
     // the error message when a Bin/LP problem is found.
@@ -43,7 +43,7 @@ define(['N/search', 'N/query', 'N/log', 'N/record', 'N/runtime', 'N/lock'],
     var BYPASS_ITEM_ID     = 11953; // SAU290B150
     var LP_PREFIX          = 'S';
     var LP_START_NUMBER    = 1000;
-    var LP_COUNTER_LOCK_KEY = 'sams_return_bin_lp_counter';
+    var LP_CREATE_MAX_ATTEMPTS = 5;
 
     // customrecord_inventory_adjustment_reques -> custrecord_approval_status
     // values that count as "final" (no longer reserve quantity against
@@ -125,14 +125,16 @@ define(['N/search', 'N/query', 'N/log', 'N/record', 'N/runtime', 'N/lock'],
     }
 
     // ------------------------------------------------------------------
-    // createNextReturnBin - mints the next S#### return LP, creates the
-    // real Bin record for it (flagged "Sam's Return Bin"), and returns
-    // its name. Locked so two lines saved back-to-back can't land on the
-    // same number.
+    // createNextReturnBin - mints the next S#### return LP and creates
+    // the real Bin record for it (flagged "Sam's Return Bin"). NetSuite
+    // has no general-purpose lock module, so instead of locking a key
+    // this re-reads the current max and retries a few times if the
+    // create fails - which only happens if another line grabbed the
+    // same number first, since Bin Number is unique per Location.
     // ------------------------------------------------------------------
     function createNextReturnBin() {
-        var scriptLock = lock.acquireLock({ key: LP_COUNTER_LOCK_KEY, timeout: 15 });
-        try {
+        var lastError;
+        for (var attempt = 0; attempt < LP_CREATE_MAX_ATTEMPTS; attempt++) {
             var sql =
                 "SELECT MAX(TO_NUMBER(SUBSTR(binnumber, 2))) AS maxnum FROM bin " +
                 "WHERE custrecord_sams_return_bin = 'T' AND REGEXP_LIKE(binnumber, '^" + LP_PREFIX + "[0-9]+$')";
@@ -142,19 +144,21 @@ define(['N/search', 'N/query', 'N/log', 'N/record', 'N/runtime', 'N/lock'],
             var nextNum = Math.max(maxNum + 1, LP_START_NUMBER);
             var binName = LP_PREFIX + nextNum;
 
-            var binRecord = record.create({ type: 'bin', isDynamic: false });
-            binRecord.setValue({ fieldId: 'binnumber', value: binName });
-            binRecord.setValue({ fieldId: 'location', value: BYPASS_LOCATION_ID });
-            binRecord.setValue({ fieldId: 'custrecord_sams_return_bin', value: true });
-            binRecord.save();
-
-            return binName;
-        } catch (e) {
-            log.error('createNextReturnBin failed', e.message);
-            throw new Error('Could not create the next return LP: ' + e.message);
-        } finally {
-            scriptLock.release();
+            try {
+                var binRecord = record.create({ type: 'bin', isDynamic: false });
+                binRecord.setValue({ fieldId: 'binnumber', value: binName });
+                binRecord.setValue({ fieldId: 'location', value: BYPASS_LOCATION_ID });
+                binRecord.setValue({ fieldId: 'custrecord_sams_return_bin', value: true });
+                binRecord.save();
+                return binName;
+            } catch (e) {
+                lastError = e;
+                log.audit('createNextReturnBin retry', 'Attempt ' + (attempt + 1) + ' for "' + binName + '" failed: ' + e.message);
+            }
         }
+        log.error('createNextReturnBin failed', lastError ? lastError.message : 'unknown error');
+        throw new Error('Could not create the next return LP after ' + LP_CREATE_MAX_ATTEMPTS + ' attempts: ' +
+            (lastError ? lastError.message : 'unknown error'));
     }
 
     // ------------------------------------------------------------------
