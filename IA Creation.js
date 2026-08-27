@@ -635,16 +635,13 @@ define(['N/record', 'N/search', 'N/runtime', 'N/email', 'N/query', 'N/log'],
             // Set the Atlas reason body field (drives UI display + Atlas workflow)
             iaRec.setValue({ fieldId: 'custbody_atlas_inv_adj_reason', value: adjReason });
 
-            // Reason -> Account mapping: look up the account on the reason record
-            // and set it explicitly (UI sourcing does not fire server-side)
+            // Reason -> Account mapping: look up the account on the reason record.
+            // Actually SET further down, right before save() - enableSourcing:true
+            // on save() re-runs field sourcing and was silently re-deriving (blanking)
+            // this field regardless of when it was set earlier in the script, so it
+            // has to be the very last thing written before the record is posted.
             var reasonAccount = getReasonAccount(adjReason);
-            if (reasonAccount) {
-                // Dynamic mode needs a number here, not the string search.lookupFields()
-                // returns - passing a string silently fails to select the option (no
-                // error, field just reads back empty at save time).
-                iaRec.setValue({ fieldId: 'account', value: parseInt(reasonAccount, 10) });
-                log.debug('Account sourced from reason', 'Reason: ' + adjReason + ' Account: ' + reasonAccount);
-            } else {
+            if (!reasonAccount) {
                 log.error('No account on reason', 'Reason record ' + adjReason + ' has no account mapped.');
             }
 
@@ -704,8 +701,16 @@ define(['N/record', 'N/search', 'N/runtime', 'N/email', 'N/query', 'N/log'],
                 iaRec.commitLine({ sublistId: 'inventory' });
             }
 
+            if (reasonAccount) {
+                // Dynamic mode needs a number here, not the string search.lookupFields()
+                // returns. Set last, immediately before save(), so nothing after this
+                // point (including save()'s own sourcing pass) can clear it.
+                iaRec.setValue({ fieldId: 'account', value: parseInt(reasonAccount, 10) });
+                log.debug('Account sourced from reason', 'Reason: ' + adjReason + ' Account: ' + reasonAccount);
+            }
+
             var newIaId = iaRec.save({
-                enableSourcing:        true,
+                enableSourcing:        false,
                 ignoreMandatoryFields: false
             });
             log.audit('IA Created', 'New IA: ' + newIaId);
