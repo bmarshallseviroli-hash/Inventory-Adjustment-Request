@@ -300,6 +300,13 @@ define(['N/search', 'N/query', 'N/log', 'N/record', 'N/runtime'],
     // ------------------------------------------------------------------
     function beforeSubmit(scriptContext) {
         var t = scriptContext.type;
+        try {
+            var diagUser = runtime.getCurrentUser();
+            log.audit('beforeSubmit fired', 'type=' + t + ' role=' + (diagUser && diagUser.role) +
+                ' recordId=' + (scriptContext.newRecord && scriptContext.newRecord.id));
+        } catch (diagErr) {
+            log.audit('beforeSubmit fired', 'type=' + t + ' (diag failed: ' + diagErr.message + ')');
+        }
         if (t !== scriptContext.UserEventType.CREATE &&
             t !== scriptContext.UserEventType.EDIT &&
             t !== scriptContext.UserEventType.XEDIT) {
