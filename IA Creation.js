@@ -51,6 +51,20 @@ define(['N/record', 'N/search', 'N/runtime', 'N/email', 'N/query', 'N/log'],
     var STATUS_FINANCE_APPROVED = 4; // Finance approved - triggers Inventory Adjustment creation
     var STATUS_REJECTED         = 7; // Rejected - no Inventory Adjustment created
 
+    // ------------------------------------------------------------------
+    // Recall bypass line defaults / LP minting. Lives here (not in
+    // ia_line_validation.js) because customrecord_ia_request_lines'
+    // own beforeSubmit could not be made to fire for role 1695 no
+    // matter how the deployment was configured - moved to this script
+    // instead, which is proven to run, right before the real Inventory
+    // Adjustment gets built.
+    // ------------------------------------------------------------------
+    var BYPASS_LOCATION_ID     = 11;   // Seviroli Food Garden City
+    var BYPASS_ITEM_ID         = 11953; // SAU290B150
+    var LP_PREFIX              = 'S';
+    var LP_START_NUMBER        = 1000;
+    var LP_CREATE_MAX_ATTEMPTS = 5;
+
     // NetSuite account ID, used to build Bin List / Cycle Count links
     // that get dropped into validation-failure emails.
     var ACCOUNT_ID = '682633';
@@ -580,8 +594,8 @@ define(['N/record', 'N/search', 'N/runtime', 'N/email', 'N/query', 'N/log'],
     // by both the normal EDIT-transition path and the recall-bypass
     // CREATE path - same logic either way, no duplication.
     // ------------------------------------------------------------------
-    function createInventoryAdjustment(iaRequestId) {
-        log.audit('IA Creation Triggered', 'Request: ' + iaRequestId);
+    function createInventoryAdjustment(iaRequestId, isBypassRequest) {
+        log.audit('IA Creation Triggered', 'Request: ' + iaRequestId + (isBypassRequest ? ' (recall bypass)' : ''));
         try {
             var iaRequestRec = record.load({
                 type: 'customrecord_inventory_adjustment_reques',
@@ -609,6 +623,7 @@ define(['N/record', 'N/search', 'N/runtime', 'N/email', 'N/query', 'N/log'],
                 ]
             }).run().each(function (result) {
                 lines.push({
+                    id:          result.id,
                     item:        result.getValue('custrecord_item'),
                     description: result.getValue('custrecord_description'),
                     adjustQty:   parseFloat(result.getValue('custrecord_adjust_qty_by') || 0),
@@ -621,6 +636,24 @@ define(['N/record', 'N/search', 'N/runtime', 'N/email', 'N/query', 'N/log'],
             if (lines.length === 0) {
                 log.error('No lines', 'No lines on request ' + iaRequestId);
                 return;
+            }
+
+            // Recall bypass: force item/location and mint a return LP for
+            // any line missing one - see the constants/comment near
+            // ROLES for why this lives here instead of the line record's
+            // own script.
+            if (isBypassRequest) {
+                lines.forEach(function (line) {
+                    if (!line.item) { return; }
+                    line.item = BYPASS_ITEM_ID;
+                    line.location = BYPASS_LOCATION_ID;
+                    var lineUpdates = { custrecord_item: BYPASS_ITEM_ID, custrecord_location: BYPASS_LOCATION_ID };
+                    if (!line.binNumber) {
+                        line.binNumber = createNextReturnBin();
+                        lineUpdates.custrecord_binlp_number = line.binNumber;
+                    }
+                    record.submitFields({ type: 'customrecord_ia_request_lines', id: line.id, values: lineUpdates });
+                });
             }
 
             // All inventory adjustments default to Seviroli Foods, LLC
@@ -797,7 +830,7 @@ define(['N/record', 'N/search', 'N/runtime', 'N/email', 'N/query', 'N/log'],
             if (!isBypassCreate) {
                 return;
             }
-            createInventoryAdjustment(newRec.id);
+            createInventoryAdjustment(newRec.id, true);
             return;
         }
 
@@ -869,6 +902,42 @@ define(['N/record', 'N/search', 'N/runtime', 'N/email', 'N/query', 'N/log'],
             log.error('getReasonAccount failed', e.message + ' - check FIELD_ID matches the account field on the reason record');
         }
         return accountId;
+    }
+
+    // ------------------------------------------------------------------
+    // createNextReturnBin - mints the next S#### return LP and creates
+    // the real Bin record for it (flagged "Sam's Return Bin"). Retries
+    // on a rare collision instead of locking - Bin Number is unique per
+    // Location, so a genuine collision throws and gets retried with a
+    // fresh MAX rather than needing a lock.
+    // ------------------------------------------------------------------
+    function createNextReturnBin() {
+        var lastError;
+        for (var attempt = 0; attempt < LP_CREATE_MAX_ATTEMPTS; attempt++) {
+            var sql =
+                "SELECT MAX(TO_NUMBER(SUBSTR(binnumber, 2))) AS maxnum FROM bin " +
+                "WHERE custrecord_sams_return_bin = 'T' AND REGEXP_LIKE(binnumber, '^" + LP_PREFIX + "[0-9]+$')";
+            var results = query.runSuiteQL({ query: sql }).asMappedResults();
+            var maxNum = (results.length > 0 && results[0].maxnum !== null && results[0].maxnum !== undefined)
+                ? parseInt(results[0].maxnum, 10) : (LP_START_NUMBER - 1);
+            var nextNum = Math.max(maxNum + 1, LP_START_NUMBER);
+            var binName = LP_PREFIX + nextNum;
+
+            try {
+                var binRecord = record.create({ type: 'bin', isDynamic: false });
+                binRecord.setValue({ fieldId: 'binnumber', value: binName });
+                binRecord.setValue({ fieldId: 'location', value: BYPASS_LOCATION_ID });
+                binRecord.setValue({ fieldId: 'custrecord_sams_return_bin', value: true });
+                binRecord.save();
+                return binName;
+            } catch (e) {
+                lastError = e;
+                log.audit('createNextReturnBin retry', 'Attempt ' + (attempt + 1) + ' for "' + binName + '" failed: ' + e.message);
+            }
+        }
+        log.error('createNextReturnBin failed', lastError ? lastError.message : 'unknown error');
+        throw new Error('Could not create the next return LP after ' + LP_CREATE_MAX_ATTEMPTS + ' attempts: ' +
+            (lastError ? lastError.message : 'unknown error'));
     }
 
     // ------------------------------------------------------------------
