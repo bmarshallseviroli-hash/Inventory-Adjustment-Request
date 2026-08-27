@@ -490,6 +490,16 @@ define(['N/record', 'N/search', 'N/runtime', 'N/email', 'N/query', 'N/log'],
     function beforeSubmit(scriptContext) {
         var currentUser = runtime.getCurrentUser();
         var rec = scriptContext.newRecord;
+
+        // Recall bypass: force Adjustment Location on the header the moment
+        // it's created. createInventoryAdjustment() reads this field back
+        // off the header and pushes it onto every line, so forcing it here
+        // is the single source of truth for both.
+        if (scriptContext.type === scriptContext.UserEventType.CREATE &&
+            Number(currentUser.role) === ROLES.RECALL_BYPASS) {
+            rec.setValue({ fieldId: 'custrecord_adjustment_location', value: BYPASS_LOCATION_ID });
+        }
+
         // Requested By is stamped by the workflow (Pending Manager Approval state, on Entry)
         if (scriptContext.type !== scriptContext.UserEventType.EDIT) {
             return;
@@ -646,10 +656,10 @@ define(['N/record', 'N/search', 'N/runtime', 'N/email', 'N/query', 'N/log'],
                 lines.forEach(function (line) {
                     if (!line.item) { return; }
                     line.item = BYPASS_ITEM_ID;
-                    line.location = BYPASS_LOCATION_ID;
-                    var lineUpdates = { custrecord_item: BYPASS_ITEM_ID, custrecord_location: BYPASS_LOCATION_ID };
+                    line.location = adjLocation; // whatever's actually on the header - forced in beforeSubmit
+                    var lineUpdates = { custrecord_item: BYPASS_ITEM_ID, custrecord_location: adjLocation };
                     if (!line.binNumber) {
-                        line.binNumber = createNextReturnBin();
+                        line.binNumber = createNextReturnBin(adjLocation);
                         lineUpdates.custrecord_binlp_number = line.binNumber;
                     }
                     record.submitFields({ type: 'customrecord_ia_request_lines', id: line.id, values: lineUpdates });
@@ -911,7 +921,7 @@ define(['N/record', 'N/search', 'N/runtime', 'N/email', 'N/query', 'N/log'],
     // Location, so a genuine collision throws and gets retried with a
     // fresh MAX rather than needing a lock.
     // ------------------------------------------------------------------
-    function createNextReturnBin() {
+    function createNextReturnBin(locationId) {
         var lastError;
         for (var attempt = 0; attempt < LP_CREATE_MAX_ATTEMPTS; attempt++) {
             var sql =
@@ -926,7 +936,7 @@ define(['N/record', 'N/search', 'N/runtime', 'N/email', 'N/query', 'N/log'],
             try {
                 var binRecord = record.create({ type: 'bin', isDynamic: false });
                 binRecord.setValue({ fieldId: 'binnumber', value: binName });
-                binRecord.setValue({ fieldId: 'location', value: BYPASS_LOCATION_ID });
+                binRecord.setValue({ fieldId: 'location', value: locationId || BYPASS_LOCATION_ID });
                 binRecord.setValue({ fieldId: 'custrecord_sams_return_bin', value: true });
                 binRecord.save();
                 return binName;
